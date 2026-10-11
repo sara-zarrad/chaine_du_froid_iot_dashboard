@@ -298,6 +298,20 @@
             color: var(--text-muted);
         }
 
+        /* ===== Carte « Risque de rupture (IA) » ===== */
+        .risk-card { grid-column: 1 / -1; }
+        .risk-body { display: flex; align-items: center; gap: 24px; flex-wrap: wrap; }
+        .risk-score { font-size: 44px; font-weight: 800; line-height: 1; color: var(--text-navy-primary); min-width: 110px; }
+        .risk-score small { font-size: 18px; font-weight: 600; color: var(--text-muted); }
+        .risk-meta { flex: 1 1 260px; display: flex; flex-direction: column; gap: 8px; }
+        .risk-reason { font-size: 14px; color: var(--text-navy-secondary); }
+        .risk-bar-track { height: 10px; border-radius: 999px; background: var(--border-card); overflow: hidden; }
+        .risk-bar-fill { height: 100%; width: 0%; border-radius: 999px; background: var(--green-ok); transition: width .4s ease, background .4s ease; }
+        .risk-bar-fill.medium { background: var(--orange-offline); }
+        .risk-bar-fill.high, .risk-bar-fill.breach { background: var(--red-alert); }
+        .temp-status-tag.warn { background: var(--orange-offline-bg); color: #B45309; }
+        .risk-note { font-size: 12px; color: var(--text-muted); }
+
         .temp-status-tag {
             display: inline-flex;
             align-items: center;
@@ -834,6 +848,22 @@
                     </div>
                 </div>
             </section>
+
+            <!-- 4 bis. CARTE RISQUE DE RUPTURE (IA) -->
+            <section class="card risk-card" aria-labelledby="title-risk-card">
+                <div class="card-header">
+                    <h2 id="title-risk-card" class="card-title">🔮 Risque de rupture dans la prochaine minute (IA)</h2>
+                    <span id="riskLevelTag" class="temp-status-tag ok">En attente</span>
+                </div>
+                <div class="risk-body">
+                    <div class="risk-score"><span id="riskPercent">--</span><small>%</small></div>
+                    <div class="risk-meta">
+                        <div class="risk-bar-track"><div id="riskBarFill" class="risk-bar-fill"></div></div>
+                        <span id="riskReason" class="risk-reason">Pas assez de mesures pour estimer le risque.</span>
+                        <span class="risk-note">Régression logistique entraînée sur des données simulées : estimation indicative, à lire avec la température mesurée.</span>
+                    </div>
+                </div>
+            </section>
         </div>
 
         <!-- 5. CARTE DU TRANSPORT (LEAFLET) -->
@@ -1184,6 +1214,80 @@
         // ====================================================================
         // RENDU DE L'INTERFACE UTILISATEUR
         // ====================================================================
+        // ====================================================================
+        // RISQUE DE RUPTURE (IA) : mêmes calculs que froid_api/app/risk.py
+        // Coefficients générés par froid_api/ml/train_risk_model.py
+        // ====================================================================
+        const RISK_MODEL = {"window": 6, "horizon_s": 60, "features": ["margin", "approach", "std", "margin_proj", "log_ttb"], "mean": [2.0143553113983907, 0.058228395888543345, 0.19627995640290258, 1.9094756582644037, 6.08958279759382], "scale": [0.6461775268407876, 0.43105000599335586, 0.11748645866284355, 0.7666892849122349, 0.6376037434238782], "coef": [-1.9484280707939767, -0.5338072538886046, 0.30349771270737613, -1.0791913042481929, -0.06452375339771801], "intercept": -7.8231817573143, "thresholds": {"medium": 0.3, "high": 0.6}};
+        const riskLevelTag = document.getElementById('riskLevelTag');
+        const riskPercent = document.getElementById('riskPercent');
+        const riskBarFill = document.getElementById('riskBarFill');
+        const riskReason = document.getElementById('riskReason');
+
+        function computeRiskFeatures(points) {
+            const pts = points
+                .filter(p => typeof p.temperature === 'number' && p.ts)
+                .sort((a, b) => a.ts - b.ts)
+                .slice(-RISK_MODEL.window);
+            if (pts.length < 3) return null;
+            const t0 = pts[pts.length - 1].ts;
+            const xs = pts.map(p => (p.ts - t0) / 60000);
+            const ys = pts.map(p => p.temperature);
+            const n = pts.length;
+            const mx = xs.reduce((a, b) => a + b, 0) / n;
+            const my = ys.reduce((a, b) => a + b, 0) / n;
+            const varX = xs.reduce((a, x) => a + (x - mx) ** 2, 0);
+            if (varX < 1e-12) return null;
+            const slope = xs.reduce((a, x, i) => a + (x - mx) * (ys[i] - my), 0) / varX;
+            const std = Math.sqrt(ys.reduce((a, y) => a + (y - my) ** 2, 0) / n);
+            const temp = ys[n - 1];
+            const projected = temp + slope * (RISK_MODEL.horizon_s / 60);
+            const margin = Math.min(TEMP_MAX - temp, temp - TEMP_MIN);
+            const marginProj = Math.min(TEMP_MAX - projected, projected - TEMP_MIN);
+            const approach = (TEMP_MAX - temp) <= (temp - TEMP_MIN) ? slope : -slope;
+            const ttb = approach <= 1e-6 ? 600 : Math.min(600, Math.max(margin, 0) / approach * 60);
+            return { temp, slope, std, margin, margin_proj: marginProj, approach, log_ttb: Math.log1p(ttb) };
+        }
+
+        function predictRisk(points) {
+            const f = computeRiskFeatures(points);
+            if (!f) return { level: 'unknown', probability: null, reason: 'Pas assez de mesures (3 minimum) pour estimer le risque.' };
+            if (f.margin < 0) return { level: 'breach', probability: 1, reason: 'La température est déjà hors de la plage autorisée.' };
+            let z = RISK_MODEL.intercept;
+            RISK_MODEL.features.forEach((name, i) => {
+                z += RISK_MODEL.coef[i] * (f[name] - RISK_MODEL.mean[i]) / RISK_MODEL.scale[i];
+            });
+            const proba = 1 / (1 + Math.exp(-z));
+            let eta = null;
+            if (f.slope > 1e-6) eta = (TEMP_MAX - f.temp) / f.slope * 60;
+            else if (f.slope < -1e-6) eta = (f.temp - TEMP_MIN) / -f.slope * 60;
+            if (eta !== null && eta > 3600) eta = null;
+            const th = RISK_MODEL.thresholds;
+            const level = proba >= th.high ? 'high' : proba >= th.medium ? 'medium' : 'low';
+            let reason = 'Température stable et loin des limites.';
+            if (level !== 'low') {
+                const bound = f.slope > 0 ? '8 °C' : '2 °C';
+                const etaTxt = eta !== null ? ` (environ ${Math.round(eta)} s)` : '';
+                reason = `Tendance de ${f.slope >= 0 ? '+' : ''}${f.slope.toFixed(2)} °C/min vers ${bound}${etaTxt}.`;
+            }
+            return { level, probability: proba, reason };
+        }
+
+        function renderRisk(isOffline) {
+            const r = isOffline
+                ? { level: 'unknown', probability: null, reason: 'Capteur hors ligne : aucune mesure récente.' }
+                : predictRisk(logHistory);
+            const labels = { unknown: 'En attente', low: 'Risque faible', medium: 'Risque modéré', high: 'Risque élevé', breach: 'Rupture en cours' };
+            const classes = { unknown: 'offline', low: 'ok', medium: 'warn', high: 'alert', breach: 'alert' };
+            riskLevelTag.className = 'temp-status-tag ' + classes[r.level];
+            riskLevelTag.textContent = labels[r.level];
+            const pct = r.probability === null ? null : Math.round(r.probability * 100);
+            riskPercent.textContent = pct === null ? '--' : String(pct);
+            riskBarFill.style.width = (pct === null ? 0 : pct) + '%';
+            riskBarFill.className = 'risk-bar-fill ' + (r.level === 'medium' || r.level === 'high' || r.level === 'breach' ? r.level : '');
+            riskReason.textContent = r.reason;
+        }
+
         function renderUI() {
             if (!currentData) {
                 return;
@@ -1262,6 +1366,9 @@
 
             // 7. Tableau des 20 dernières mesures
             renderMeasurementsTable();
+
+            // 8. Risque de rupture (IA)
+            renderRisk(isOffline);
         }
 
         function renderAlertsList() {
